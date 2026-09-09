@@ -91,6 +91,7 @@ where
 /// manifest schema from the input type and validates by deserialising into it;
 /// [`Action::json`] hands raw JSON to the handler and takes its schema and its
 /// validator separately.
+#[derive(Clone)]
 pub struct Action {
     name: String,
     description: String,

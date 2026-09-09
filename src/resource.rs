@@ -162,6 +162,7 @@ impl fmt::Debug for ResourceSubscriber {
 /// current value. Adding a subscriber with [`Resource::subscribe`] also lets the
 /// agent ask to be pushed to, and is what declares the resource subscribable in
 /// the manifest.
+#[derive(Clone)]
 pub struct Resource {
     name: String,
     description: String,

@@ -31,6 +31,10 @@ pub mod methods {
     pub const CANCEL: &str = "actions/cancel";
     /// Streams a progress update during an invocation. A notification.
     pub const PROGRESS: &str = "actions/progress";
+    /// Announces the full action manifest after a registration changes.
+    pub const ACTIONS_LIST_CHANGED: &str = "actions/list_changed";
+    /// Announces the full resource manifest after a registration changes.
+    pub const RESOURCES_LIST_CHANGED: &str = "resources/list_changed";
     /// Reads one resource's current value.
     pub const READ: &str = "resources/read";
     /// Registers a subscriber for one resource's future values.
@@ -311,6 +315,20 @@ pub(crate) struct SubscribeResourceParams {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UnsubscribeResourceParams {
     pub subscription_id: String,
+}
+
+/// Parameters announcing the full action manifest.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActionsListChangedParams {
+    pub actions: Vec<ActionDescriptor>,
+}
+
+/// Parameters announcing the full resource manifest.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResourcesListChangedParams {
+    pub resources: Vec<ResourceDescriptor>,
 }
 
 /// `resources/updated` parameters.

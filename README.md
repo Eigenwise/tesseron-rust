@@ -112,6 +112,15 @@ Subscribe *before* `listen()`. The gateway can dial and finish the handshake
 before `listen()` returns, and a receiver created afterwards misses the welcome
 that carries the claim code.
 
+After `listen()`, `host.register_action(action)` and
+`host.register_resource(resource)` add or replace entries by name. Replacement
+keeps the original manifest position. `host.remove_action(name)` and
+`host.remove_resource(name)` return whether an entry existed. These synchronous
+methods take `&self` and can be called from any thread. A welcomed, connected
+gateway receives the full changed list; otherwise the next handshake carries it.
+Replacing or removing a resource stops its subscriptions, so the agent must
+subscribe again.
+
 ## Examples
 
 Run `cargo run --manifest-path sdks/rust/examples/todo/Cargo.toml` for the headless todo app.

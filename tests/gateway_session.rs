@@ -1312,3 +1312,337 @@ async fn a_claim_that_lands_behind_the_welcome_still_names_the_agent() {
     gateway.drop_transport().await;
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registering_an_action_after_welcome_pushes_the_full_action_manifest() {
+    let action = Action::json("echo", |input, _context| async move { Ok(input) })
+        .description("Echoes the input")
+        .input_schema(json!({ "type": "object" }))
+        .output_schema(json!({ "type": "object" }))
+        .timeout(Duration::from_secs(2));
+    let (reference, _reference_events) = started(with_actions().action(action.clone())).await;
+    let mut reference_gateway = Gateway::dial(reference.url()).await;
+    let expected = reference_gateway
+        .answer_next(welcome("reference", "reference-token", None))
+        .await;
+    let (host, mut events) = started(with_actions()).await;
+    let mut gateway = Gateway::dial(host.url()).await;
+    gateway
+        .answer_next(welcome("session-1", "token-1", None))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+
+    std::thread::scope(|scope| scope.spawn(|| host.register_action(action)).join().unwrap());
+    let notification = gateway.next_frame().await;
+    assert_eq!(
+        notification,
+        json!({
+            "jsonrpc": "2.0", "method": "actions/list_changed",
+            "params": { "actions": expected["params"]["actions"] }
+        })
+    );
+    let result = gateway
+        .call(
+            1,
+            "actions/invoke",
+            json!({
+                "name": "echo", "invocationId": "echo-1", "input": { "message": "hello" }
+            }),
+        )
+        .await;
+    assert_eq!(result["result"]["output"], json!({ "message": "hello" }));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    gateway.drop_transport().await;
+    reference_gateway.drop_transport().await;
+    reference.shutdown().await.unwrap();
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_resource_after_welcome_notifies_and_unknown_names_are_silent() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&stopped);
+    let emitters = Arc::new(Mutex::new(Vec::new()));
+    let stored_emitters = Arc::clone(&emitters);
+    let resource = Resource::new("cart", || async { Ok(Value::Null) }).subscribe(move |emitter| {
+        stored_emitters.lock().unwrap().push(emitter);
+        let counter = Arc::clone(&counter);
+        Subscription::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    let (host, mut events) = started(with_actions().resource(resource)).await;
+    let mut gateway = Gateway::dial(host.url()).await;
+    let hello = gateway
+        .answer_next(welcome("session-1", "token-1", None))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+    for identifier in ["cart-1", "cart-2"] {
+        assert_eq!(
+            gateway
+                .call(
+                    1,
+                    "resources/subscribe",
+                    json!({
+                        "name": "cart", "subscriptionId": identifier
+                    })
+                )
+                .await["result"],
+            Value::Null
+        );
+    }
+    gateway
+        .call(2, "resources/read", json!({ "name": "cart" }))
+        .await;
+
+    assert!(host.remove_resource("cart"));
+    assert_eq!(stopped.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        gateway.next_frame().await,
+        json!({
+            "jsonrpc": "2.0", "method": "resources/list_changed",
+            "params": { "resources": [hello["params"]["resources"][0]] }
+        })
+    );
+    assert!(!host.remove_resource("missing"));
+    for emitter in emitters.lock().unwrap().iter() {
+        emitter.emit(json!("stale"));
+    }
+    gateway.expect_silence(Duration::from_millis(200)).await;
+    gateway.drop_transport().await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Disconnected
+    ));
+    assert_eq!(stopped.load(Ordering::SeqCst), 2);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registrations_before_welcome_are_carried_by_hello_and_send_nothing() {
+    let (host, mut events) = started(application()).await;
+    host.register_action(Action::json(
+        "echo",
+        |input, _context| async move { Ok(input) },
+    ));
+    host.register_resource(Resource::new("settings", || async { Ok(Value::Null) }));
+    let mut gateway = Gateway::dial(host.url()).await;
+    let hello = gateway.next_frame().await;
+    assert_eq!(hello["method"], "tesseron/hello");
+    assert_eq!(
+        hello["params"]["actions"],
+        json!([
+            { "name": "echo", "description": "", "inputSchema": {} }
+        ])
+    );
+    assert_eq!(
+        hello["params"]["resources"],
+        json!([
+            { "name": "settings", "description": "", "subscribable": false }
+        ])
+    );
+    host.register_action(Action::json("waiting", |input, _context| async move {
+        Ok(input)
+    }));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    gateway
+        .send(json!({ "jsonrpc": "2.0", "id": hello["id"],
+        "result": welcome("session-1", "token-1", None) }))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    gateway.drop_transport().await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Disconnected
+    ));
+
+    host.register_resource(Resource::new("offline", || async { Ok(Value::Null) }));
+    assert!(host.remove_action("echo"));
+    let mut gateway = Gateway::dial(host.url()).await;
+    let resume = gateway.next_frame().await;
+    assert_eq!(resume["method"], "tesseron/resume");
+    assert_eq!(resume["params"]["actions"][0]["name"], "waiting");
+    assert_eq!(resume["params"]["actions"].as_array().unwrap().len(), 1);
+    assert_eq!(resume["params"]["resources"][1]["name"], "offline");
+    host.register_action(Action::json("resuming", |input, _context| async move {
+        Ok(input)
+    }));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    gateway
+        .send(json!({ "jsonrpc": "2.0", "id": resume["id"],
+        "result": welcome("session-1", "token-2", None) }))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    gateway.drop_transport().await;
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_an_action_swaps_its_handler_and_keeps_its_position() {
+    let (host, mut events) = started(with_actions()).await;
+    let mut gateway = Gateway::dial(host.url()).await;
+    let hello = gateway
+        .answer_next(welcome("session-1", "token-1", None))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+    let names = hello["params"]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["name"].clone())
+        .collect::<Vec<_>>();
+    for output in ["first", "second"] {
+        host.register_action(
+            Action::json(
+                "add",
+                move |_input, _context| async move { Ok(json!(output)) },
+            )
+            .description(output)
+            .validate_with(|input: &Value| {
+                if input == &json!("allowed") {
+                    Ok(())
+                } else {
+                    Err(vec![ValidationIssue::at_root("expected allowed")])
+                }
+            }),
+        );
+        let notification = gateway.next_frame().await;
+        assert_eq!(notification["method"], "actions/list_changed");
+        let manifest = notification["params"]["actions"].as_array().unwrap();
+        assert_eq!(
+            manifest
+                .iter()
+                .map(|action| action["name"].clone())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(manifest[0]["description"], output);
+        assert_eq!(manifest[0]["inputSchema"], json!({}));
+    }
+    let rejected = gateway
+        .call(
+            1,
+            "actions/invoke",
+            json!({
+                "name": "add", "invocationId": "rejected", "input": { "left": 1, "right": 2 }
+            }),
+        )
+        .await;
+    assert_eq!(rejected["error"]["code"], -32004);
+    let result = gateway
+        .call(
+            2,
+            "actions/invoke",
+            json!({
+                "name": "add", "invocationId": "replaced", "input": "allowed"
+            }),
+        )
+        .await;
+    assert_eq!(result["result"]["output"], "second");
+    assert!(host.remove_action("add"));
+    assert_eq!(
+        gateway.next_frame().await["params"]["actions"][0]["name"],
+        "never_finishes"
+    );
+    assert!(!host.remove_action("missing"));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    host.register_action(Action::json(
+        "add",
+        |input, _context| async move { Ok(input) },
+    ));
+    assert_eq!(
+        gateway.next_frame().await["params"]["actions"][1]["name"],
+        "add"
+    );
+    gateway.drop_transport().await;
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replacing_a_resource_stops_old_subscriptions_and_allows_resubscribing() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&stopped);
+    let emitters = Arc::new(Mutex::new(Vec::new()));
+    let stored_emitters = Arc::clone(&emitters);
+    let resource = Resource::new("cart", || async { Ok(json!("old")) }).subscribe(move |emitter| {
+        stored_emitters.lock().unwrap().push(emitter);
+        let counter = Arc::clone(&counter);
+        Subscription::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    let (host, mut events) = started(with_actions().resource(resource)).await;
+    let mut gateway = Gateway::dial(host.url()).await;
+    let hello = gateway
+        .answer_next(welcome("session-1", "token-1", None))
+        .await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        HostEvent::Welcome(_)
+    ));
+    gateway
+        .call(
+            1,
+            "resources/subscribe",
+            json!({ "name": "cart", "subscriptionId": "old" }),
+        )
+        .await;
+    gateway
+        .call(2, "resources/read", json!({ "name": "cart" }))
+        .await;
+    host.register_resource(
+        Resource::new("cart", || async { Ok(json!("new")) })
+            .description("Replacement")
+            .subscribe(|emitter| {
+                emitter.emit(json!("new update"));
+                Subscription::without_cleanup()
+            }),
+    );
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        gateway.next_frame().await,
+        json!({
+            "jsonrpc": "2.0", "method": "resources/list_changed",
+            "params": { "resources": [hello["params"]["resources"][0], {
+                "name": "cart", "description": "Replacement", "subscribable": true
+            }] }
+        })
+    );
+    emitters.lock().unwrap()[0].emit(json!("stale"));
+    gateway.expect_silence(Duration::from_millis(100)).await;
+    assert_eq!(
+        gateway
+            .call(3, "resources/read", json!({ "name": "cart" }))
+            .await["result"]["value"],
+        "new"
+    );
+    gateway
+        .call(
+            4,
+            "resources/subscribe",
+            json!({ "name": "cart", "subscriptionId": "new" }),
+        )
+        .await;
+    let update = gateway.next_frame().await;
+    assert_eq!(update["params"]["subscriptionId"], "new");
+    assert_eq!(update["params"]["value"], "new update");
+    gateway.drop_transport().await;
+    host.shutdown().await.unwrap();
+}

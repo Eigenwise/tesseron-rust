@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::action::issues_payload;
 use crate::context::{ActionContext, Cancellation, GatewayChannel, InvocationEnvironment};
 use crate::error::{ActionError, ProtocolError, TesseronErrorCode};
-use crate::host::{HostEvent, SharedHost};
+use crate::host::{HostEvent, RegisteredResource, SharedHost};
 use crate::jsonrpc::{self, IncomingFrame, RequestId};
 use crate::protocol::{
     CancelParams, ClaimedParams, InvokeParams, InvokeResult, PROTOCOL_VERSION, ReadResourceParams,
@@ -50,11 +50,11 @@ struct PendingRequests {
 }
 
 /// One gateway connection, from the socket opening to the socket closing.
-struct Session {
+pub(crate) struct Session {
     outgoing: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pending: Mutex<PendingRequests>,
     invocations: Mutex<HashMap<String, Cancellation>>,
-    subscriptions: Mutex<HashMap<String, Subscription>>,
+    subscriptions: Mutex<HashMap<String, (Arc<RegisteredResource>, Subscription)>>,
     next_request_id: AtomicI64,
     handshake: Mutex<HandshakeGate>,
     handshake_state: watch::Sender<HandshakeState>,
@@ -271,15 +271,37 @@ impl Session {
         }
     }
 
-    fn register_subscription(&self, subscription_id: &str, subscription: Subscription) {
-        let replaced = match self.subscriptions.lock() {
-            Ok(mut subscriptions) => subscriptions.insert(subscription_id.to_owned(), subscription),
-            // A subscription nothing can ever stop is worse than no
-            // subscription: tear it down instead of leaving it emitting.
+    fn register_subscription(
+        &self,
+        subscription_id: &str,
+        resource: Arc<RegisteredResource>,
+        subscription: Subscription,
+    ) -> Option<Subscription> {
+        match self.subscriptions.lock() {
+            Ok(mut subscriptions) => subscriptions
+                .insert(subscription_id.to_owned(), (resource, subscription))
+                .map(|(_, subscription)| subscription),
             Err(_) => Some(subscription),
+        }
+    }
+
+    pub(crate) fn drop_resource_subscriptions(&self, resource: &Arc<RegisteredResource>) {
+        let removed = match self.subscriptions.lock() {
+            Ok(mut subscriptions) => {
+                let identifiers = subscriptions
+                    .iter()
+                    .filter(|(_, (registered, _))| Arc::ptr_eq(registered, resource))
+                    .map(|(identifier, _)| identifier.clone())
+                    .collect::<Vec<_>>();
+                identifiers
+                    .into_iter()
+                    .filter_map(|identifier| subscriptions.remove(&identifier))
+                    .collect::<Vec<_>>()
+            }
+            Err(_) => Vec::new(),
         };
-        if let Some(replaced) = replaced {
-            replaced.stop();
+        for (_, subscription) in removed {
+            subscription.stop();
         }
     }
 
@@ -289,7 +311,7 @@ impl Session {
             .lock()
             .ok()
             .and_then(|mut subscriptions| subscriptions.remove(subscription_id));
-        if let Some(subscription) = subscription {
+        if let Some((_, subscription)) = subscription {
             subscription.stop();
         }
     }
@@ -302,7 +324,7 @@ impl Session {
             Ok(mut subscriptions) => subscriptions.drain().collect::<Vec<_>>(),
             Err(_) => Vec::new(),
         };
-        for (_subscription_id, subscription) in registered {
+        for (_subscription_id, (_, subscription)) in registered {
             subscription.stop();
         }
     }
@@ -364,6 +386,7 @@ pub(crate) async fn serve_connection(socket: WebSocketStream<TcpStream>, host: A
     session.fail_all_pending();
     session.stop_sending();
     let _ = handshake.await;
+    host.disconnect_session();
     let _ = writer.await;
     host.emit(HostEvent::Disconnected);
 }
@@ -510,7 +533,14 @@ fn start_invocation(id: RequestId, params: Value, session: &Arc<Session>, host: 
         }
     };
 
-    let Some(action) = host.registry.actions.get(&invoke.name).cloned() else {
+    let Some(action) = host
+        .registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .actions
+        .get(&invoke.name)
+        .cloned()
+    else {
         session.send_envelope(&jsonrpc::failure(
             &id,
             &ProtocolError::new(
@@ -619,7 +649,14 @@ fn start_resource_read(
         }
     };
 
-    let Some(resource) = host.registry.resources.get(&read.name).cloned() else {
+    let Some(resource) = host
+        .registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resources
+        .get(&read.name)
+        .cloned()
+    else {
         session.send_envelope(&jsonrpc::failure(
             &id,
             &ProtocolError::new(
@@ -676,12 +713,19 @@ fn subscribe_to_resource(
         }
     };
 
-    let subscriber = host
+    let resource = host
         .registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .resources
         .get(&subscribe.name)
-        .and_then(|resource| resource.subscriber.clone());
-    let Some(subscriber) = subscriber else {
+        .cloned();
+    let Some((resource, subscriber)) = resource.and_then(|resource| {
+        resource
+            .subscriber
+            .clone()
+            .map(|subscriber| (resource, subscriber))
+    }) else {
         session.send_envelope(&jsonrpc::failure(
             &id,
             &ProtocolError::new(
@@ -700,7 +744,24 @@ fn subscribe_to_resource(
     let subscription = subscriber
         .subscribe(emitter.clone())
         .gate_emitter(emitter.active_flag());
-    session.register_subscription(&subscribe.subscription_id, subscription);
+    let stopped = {
+        let registry = host
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry
+            .resources
+            .get(&subscribe.name)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &resource))
+        {
+            session.register_subscription(&subscribe.subscription_id, resource, subscription)
+        } else {
+            Some(subscription)
+        }
+    };
+    if let Some(subscription) = stopped {
+        subscription.stop();
+    }
 }
 
 /// Drops a subscription. An id nobody registered is not an error: the agent and
@@ -821,7 +882,7 @@ fn accept_welcome(session: &Arc<Session>, host: &Arc<SharedHost>, result: Value)
         );
         return false;
     }
-    host.record_welcome(&welcome);
+    host.record_welcome(&welcome, session);
     host.emit(HostEvent::Welcome(welcome));
     true
 }

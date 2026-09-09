@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -12,12 +12,13 @@ use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 
 use crate::action::{Action, ActionHandler, InputValidator};
+use crate::context::GatewayChannel;
 use crate::error::{HostError, ProtocolError};
 use crate::manifest::{self, InstanceManifest, ManifestPublication};
 use crate::protocol::{
-    ActionDescriptor, AgentIdentity, ApplicationDescriptor, Capabilities, ClaimedParams,
-    GATEWAY_SUBPROTOCOL, HelloParams, PROTOCOL_VERSION, ResourceDescriptor, ResumeParams,
-    WelcomeResult, is_valid_application_id,
+    ActionDescriptor, ActionsListChangedParams, AgentIdentity, ApplicationDescriptor, Capabilities,
+    ClaimedParams, GATEWAY_SUBPROTOCOL, HelloParams, PROTOCOL_VERSION, ResourceDescriptor,
+    ResourcesListChangedParams, ResumeParams, WelcomeResult, is_valid_application_id, methods,
 };
 use crate::resource::{Resource, ResourceReader, ResourceSubscriber};
 use crate::session;
@@ -69,7 +70,7 @@ pub(crate) struct RegisteredResource {
 
 pub(crate) struct Registry {
     pub actions: HashMap<String, RegisteredAction>,
-    pub resources: HashMap<String, RegisteredResource>,
+    pub resources: HashMap<String, Arc<RegisteredResource>>,
     action_order: Vec<String>,
     resource_order: Vec<String>,
 }
@@ -99,7 +100,8 @@ impl Registry {
 pub(crate) struct SharedHost {
     application: ApplicationDescriptor,
     capabilities: Capabilities,
-    pub registry: Registry,
+    pub registry: RwLock<Registry>,
+    session: Mutex<Option<Weak<session::Session>>>,
     events: broadcast::Sender<HostEvent>,
     welcome: Mutex<Option<WelcomeResult>>,
     claim: Mutex<Option<ClaimedParams>>,
@@ -112,23 +114,31 @@ impl SharedHost {
     }
 
     pub(crate) fn hello_params(&self) -> HelloParams {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         HelloParams {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             app: self.application.clone(),
-            actions: self.registry.action_descriptors(),
-            resources: self.registry.resource_descriptors(),
+            actions: registry.action_descriptors(),
+            resources: registry.resource_descriptors(),
             capabilities: self.capabilities,
         }
     }
 
     pub(crate) fn resume_params(&self, session_id: String, resume_token: String) -> ResumeParams {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         ResumeParams {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             session_id,
             resume_token,
             app: self.application.clone(),
-            actions: self.registry.action_descriptors(),
-            resources: self.registry.resource_descriptors(),
+            actions: registry.action_descriptors(),
+            resources: registry.resource_descriptors(),
             capabilities: self.capabilities,
         }
     }
@@ -143,7 +153,55 @@ impl SharedHost {
         self.resume.lock().ok().and_then(|resume| resume.clone())
     }
 
+    pub(crate) fn disconnect_session(&self) {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+
+    fn connected_session(&self) -> Option<Arc<session::Session>> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    fn notify_actions_changed(&self) {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = self.connected_session() {
+            let params = ActionsListChangedParams {
+                actions: registry.action_descriptors(),
+            };
+            session.notify(
+                methods::ACTIONS_LIST_CHANGED,
+                serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+
+    fn notify_resources_changed(&self) {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = self.connected_session() {
+            let params = ResourcesListChangedParams {
+                resources: registry.resource_descriptors(),
+            };
+            session.notify(
+                methods::RESOURCES_LIST_CHANGED,
+                serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+
     pub(crate) fn reset_session_state(&self) {
+        self.disconnect_session();
         if let Ok(mut welcome) = self.welcome.lock() {
             *welcome = None;
         }
@@ -159,9 +217,13 @@ impl SharedHost {
     ///
     /// Resume tokens are one-shot, so the freshest welcome is always the one to
     /// keep; a welcome without a token means this session cannot be resumed.
-    pub(crate) fn record_welcome(&self, welcome: &WelcomeResult) {
+    pub(crate) fn record_welcome(&self, welcome: &WelcomeResult, session: &Arc<session::Session>) {
         if let Ok(mut stored) = self.welcome.lock() {
             *stored = Some(welcome.clone());
+            *self
+                .session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::downgrade(session));
         }
         if let Ok(mut resume) = self.resume.lock() {
             *resume = welcome
@@ -353,7 +415,8 @@ impl TesseronHostBuilder {
         let shared = Arc::new(SharedHost {
             application,
             capabilities: self.capabilities,
-            registry,
+            registry: RwLock::new(registry),
+            session: Mutex::new(None),
             events: self.events.clone(),
             welcome: Mutex::new(None),
             claim: Mutex::new(None),
@@ -402,11 +465,11 @@ impl TesseronHostBuilder {
             resource_order.push(name.clone());
             resources.insert(
                 name,
-                RegisteredResource {
+                Arc::new(RegisteredResource {
                     descriptor,
                     reader,
                     subscriber,
-                },
+                }),
             );
         }
 
@@ -461,6 +524,125 @@ pub struct TesseronHost {
 }
 
 impl TesseronHost {
+    /// Adds or replaces an action, preserving its original manifest position.
+    /// A connected, welcomed gateway receives the full updated action manifest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a typed action's input schema is not an object, just as
+    /// [`TesseronHostBuilder::listen`] rejects that configuration.
+    pub fn register_action(&self, action: Action) {
+        if let Err(problem) = action.validate_configuration() {
+            panic!("{problem}");
+        }
+        let (descriptor, validator, handler) = action.into_parts();
+        let name = descriptor.name.clone();
+        let replaced = {
+            let mut registry = self
+                .shared
+                .registry
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !registry.actions.contains_key(&name) {
+                registry.action_order.push(name.clone());
+            }
+            registry.actions.insert(
+                name,
+                RegisteredAction {
+                    descriptor,
+                    validator,
+                    handler,
+                },
+            )
+        };
+        drop(replaced);
+        self.shared.notify_actions_changed();
+    }
+
+    /// Adds or replaces a resource, preserving its original manifest position.
+    /// Replacement stops live subscriptions; the agent can subscribe again.
+    /// A connected, welcomed gateway receives the full updated resource manifest.
+    pub fn register_resource(&self, resource: Resource) {
+        let (descriptor, reader, subscriber) = resource.into_parts();
+        let name = descriptor.name.clone();
+        let replaced = {
+            let mut registry = self
+                .shared
+                .registry
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !registry.resources.contains_key(&name) {
+                registry.resource_order.push(name.clone());
+            }
+            registry.resources.insert(
+                name,
+                Arc::new(RegisteredResource {
+                    descriptor,
+                    reader,
+                    subscriber,
+                }),
+            )
+        };
+        if let Some(resource) = replaced {
+            if let Some(session) = self.shared.connected_session() {
+                session.drop_resource_subscriptions(&resource);
+            }
+        }
+        self.shared.notify_resources_changed();
+    }
+
+    /// Removes an action and announces the full manifest to a welcomed gateway.
+    /// Returns false, without notifying, when the name was not registered.
+    pub fn remove_action(&self, name: &str) -> bool {
+        let removed = {
+            let mut registry = self
+                .shared
+                .registry
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let removed = registry.actions.remove(name);
+            if removed.is_some() {
+                registry
+                    .action_order
+                    .retain(|registered| registered != name);
+            }
+            removed
+        };
+        if removed.is_none() {
+            return false;
+        }
+        drop(removed);
+        self.shared.notify_actions_changed();
+        true
+    }
+
+    /// Removes a resource, stopping its subscriptions and announcing the full
+    /// manifest to a welcomed gateway. An unknown name returns false silently.
+    pub fn remove_resource(&self, name: &str) -> bool {
+        let removed = {
+            let mut registry = self
+                .shared
+                .registry
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let removed = registry.resources.remove(name);
+            if removed.is_some() {
+                registry
+                    .resource_order
+                    .retain(|registered| registered != name);
+            }
+            removed
+        };
+        let Some(resource) = removed else {
+            return false;
+        };
+        if let Some(session) = self.shared.connected_session() {
+            session.drop_resource_subscriptions(&resource);
+        }
+        self.shared.notify_resources_changed();
+        true
+    }
+
     /// The `ws://` URL the gateway dials. Also what the manifest advertises.
     #[must_use]
     pub fn url(&self) -> &str {

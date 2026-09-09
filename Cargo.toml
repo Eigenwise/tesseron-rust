@@ -1,6 +1,6 @@
 [package]
 name = "tesseron"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust SDK for the Tesseron protocol: expose typed app actions and resources to MCP-compatible agents."
 readme = "README.md"
 keywords = ["tesseron", "mcp", "jsonrpc", "agents", "websocket"]
