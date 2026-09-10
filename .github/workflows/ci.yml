@@ -47,10 +47,10 @@ jobs:
         if: runner.os != 'Windows'
         env:
           TESSERON_CONFORMANCE_UNSUPPORTED: host-minted-claim,uds
-        run: npx -y @tesseron/conformance@1.2.0 --host ./target/debug/tesseron-conformance-host
+        run: npx -y @tesseron/conformance@1.2.1 --host ./target/debug/tesseron-conformance-host
 
       - name: Run the conformance suite on Windows
         if: runner.os == 'Windows'
         env:
           TESSERON_CONFORMANCE_UNSUPPORTED: host-minted-claim,uds
-        run: npx -y @tesseron/conformance@1.2.0 --host .\target\debug\tesseron-conformance-host.exe
+        run: npx -y @tesseron/conformance@1.2.1 --host .\target\debug\tesseron-conformance-host.exe
